@@ -1,0 +1,115 @@
+From dac125c43baee7d7a3887f45e75763dca33f8225 Mon Sep 17 00:00:00 2001
+From: rdavis <ricky.c.davis.9@gmail.com>
+Date: Sat, 18 Jul 2026 19:03:11 -0500
+Subject: [PATCH] Fix speaker/jack audio on Surface Laptop 7 for Business
+ (Intel, Lunar Lake)
+
+Two fixes required to get SoundWire audio working on this machine:
+
+1. ASoC: Intel: sof_sdw: append dai type to link names when using
+   function topologies.
+   No entry in soc-acpi-intel-lnl-match.c can match this firmware:
+   it declares two RT1320 instances on link 0 differing only by
+   class_id (which snd_soc_acpi_sdw_link_slaves_found() never
+   compares, and the duplicate detection forces runtime unique_id to
+   SDW_IGNORED_UNIQUE_ID which no 4-bit .adr field can equal), so the
+   kernel falls back to the SoundWire default machine driver with
+   function topologies. Each link here carries exactly one SDCA
+   function (SmartAmp on link 0, UAJ on link 3), so append_dai_type
+   stayed false, DAI links got generic "SDW%d-Playback" names,
+   sof_sdw_get_tplg_files() could not map them to function topology
+   files, and no speaker/jack PCM devices were created. Force
+   append_dai_type when the machine uses function topologies (dummy
+   monolithic topology filename, the same signal
+   snd_sof_load_topology() uses).
+
+2. soundwire: dmi-quirks: drop phantom RT1320.
+   Of the two RT1320 _ADR instances (0x000030025D132000 class 00 and
+   0x000030025D132001 class 01) only class 01 ever attaches. The
+   class 00 phantom still got a sdw_slave device, was aggregated into
+   the SmartAmp DAI link, and programming transport params on the
+   unattached peripheral failed (-61), aborting prepare on the whole
+   Speaker PCM; PipeWire's profile probe then dropped the HiFi
+   profile. Remap the phantom _ADR to 0 so the ACPI scan skips it,
+   like the existing HP Omen 16 quirk does for its phantom RT1316.
+
+Remaining known gap: internal microphone (firmware exposes SmartMic
+SDCA functions on the RT1320s, but codec_info_list only declares an
+amp DAI for rt1320).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ drivers/soundwire/dmi-quirks.c   | 25 +++++++++++++++++++++++++
+ sound/soc/intel/boards/sof_sdw.c | 13 +++++++++++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/drivers/soundwire/dmi-quirks.c b/drivers/soundwire/dmi-quirks.c
+index 5854218e1..dccc5e825 100644
+--- a/drivers/soundwire/dmi-quirks.c
++++ b/drivers/soundwire/dmi-quirks.c
+@@ -90,6 +90,22 @@ static const struct adr_remap intel_rooks_county[] = {
+ 	{}
+ };
+ 
++/*
++ * The Microsoft Surface Laptop 7 for Business (Intel, Lunar Lake)
++ * declares two RT1320 instances on link 0 that differ only by
++ * class_id (00 and 01). Only the class_id 01 instance ever attaches
++ * on the bus; the class_id 00 phantom breaks stream setup on the
++ * aggregated amp DAI link (transport params cannot be programmed on
++ * an unattached peripheral). Drop the phantom.
++ */
++static const struct adr_remap surface_laptop_7_intel[] = {
++	{
++		0x000030025d132000ull,
++		0
++	},
++	{}
++};
++
+ static const struct dmi_system_id adr_remap_quirk_table[] = {
+ 	/* TGL devices */
+ 	{
+@@ -164,6 +180,15 @@ static const struct dmi_system_id adr_remap_quirk_table[] = {
+ 		},
+ 		.driver_data = (void *)hp_omen_16,
+ 	},
++	/* LNL devices */
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Microsoft Corporation"),
++			DMI_MATCH(DMI_PRODUCT_NAME,
++				  "Surface Laptop for Business 7th Edition with Intel"),
++		},
++		.driver_data = (void *)surface_laptop_7_intel,
++	},
+ 	{}
+ };
+ 
+diff --git a/sound/soc/intel/boards/sof_sdw.c b/sound/soc/intel/boards/sof_sdw.c
+index 50b838be2..a0f6c1af3 100644
+--- a/sound/soc/intel/boards/sof_sdw.c
++++ b/sound/soc/intel/boards/sof_sdw.c
+@@ -1246,6 +1246,19 @@ static int sof_card_dai_links_create(struct snd_soc_card *card)
+ 
+ 	sdw_be_num = ret;
+ 
++	/*
++	 * Function topologies are selected by matching the SDCA function
++	 * name embedded in the DAI link name ("SimpleJack", "SmartAmp",
++	 * "SmartMic").  When every link carries a single function,
++	 * append_dai_type stays false and the links get generic
++	 * "SDW%d-Playback" names, so sof_sdw_get_tplg_files() cannot map
++	 * them to function topology files and no PCM devices are created.
++	 * The default machine driver (dummy monolithic topology) has no
++	 * fallback, so always append the dai type there.
++	 */
++	if (mach->sof_tplg_filename && strstr(mach->sof_tplg_filename, "dummy"))
++		ctx->append_dai_type = true;
++
+ 	/*
+ 	 * on generic tgl platform, I2S or sdw mode is supported
+ 	 * based on board rework. A ACPI device is registered in
+-- 
+2.43.0
+
